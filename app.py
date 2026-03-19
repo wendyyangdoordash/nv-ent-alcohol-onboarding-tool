@@ -190,7 +190,7 @@ def run_bulk_uploads(dfs: list, names: list) -> tuple[bool, list[str]]:
     Returns (success, list of error messages). User may need to log in with SSO on first page.
     """
     try:
-        from playwright.sync_api import sync_playwright, Error as PlaywrightError
+        from playwright.sync_api import sync_playwright, Error as PlaywrightError, expect
         from playwright._impl._errors import TargetClosedError
     except ImportError:
         return (False, ["Playwright not installed. Run: pip install playwright && playwright install chromium"])
@@ -251,33 +251,44 @@ def run_bulk_uploads(dfs: list, names: list) -> tuple[bool, list[str]]:
                     except Exception:
                         errors.append(f"{name}: Timed out waiting for upload area. Log in with SSO in the browser, then try again.")
                         continue
-                    # Attach the CSV (no need to click "Upload Files" — we set the input directly)
+                    # 1) Upload: click "Upload Files" and attach CSV (matches real user flow)
                     try:
-                        page.locator('input[type="file"]').first.set_input_files(csv_path)
+                        with page.expect_file_chooser(timeout=15_000) as fc_info:
+                            page.get_by_role("button", name="Upload Files").click()
+                        fc_info.value.set_files(csv_path)
                     except TargetClosedError:
                         errors.append("The browser window was closed. Leave Chrome open until all 5 uploads complete, then try again.")
                         break
-                    # Wait for View Data step and Submit button (page may auto-advance or show Next first)
+                    except Exception:
+                        # Fallback: set file on hidden input if no file chooser
+                        try:
+                            page.locator('input[type="file"]').first.set_input_files(csv_path)
+                        except TargetClosedError:
+                            errors.append("The browser window was closed. Leave Chrome open until all 5 uploads complete, then try again.")
+                            break
+                    # 2) Click Next (validates / moves to View Data step)
+                    try:
+                        next_btn = page.get_by_role("button", name="Next")
+                        expect(next_btn).to_be_enabled(timeout=45_000)
+                        next_btn.click()
+                    except TargetClosedError:
+                        errors.append("The browser window was closed. Leave Chrome open until all 5 uploads complete, then try again.")
+                        break
+                    except Exception:
+                        errors.append(f"{name}: Could not click Next after upload. Check the browser.")
+                        continue
+                    page.wait_for_timeout(2000)
+                    # 3) Click Submit after formatting check
                     try:
                         submit = page.get_by_role("button", name="Submit")
-                        submit.wait_for(state="visible", timeout=20_000)
+                        expect(submit).to_be_enabled(timeout=45_000)
                         submit.click()
                     except TargetClosedError:
                         errors.append("The browser window was closed. Leave Chrome open until all 5 uploads complete, then try again.")
                         break
                     except Exception:
-                        # Try clicking "Next" if Submit isn't visible yet
-                        try:
-                            next_btn = page.get_by_role("button", name="Next")
-                            if next_btn.is_visible():
-                                next_btn.click()
-                                page.wait_for_timeout(2000)
-                                submit = page.get_by_role("button", name="Submit")
-                                submit.wait_for(state="visible", timeout=15_000)
-                                submit.click()
-                        except TargetClosedError:
-                            errors.append("The browser window was closed. Leave Chrome open until all 5 uploads complete, then try again.")
-                            break
+                        errors.append(f"{name}: Could not click Submit after Next. Check for validation errors in the browser.")
+                        continue
                     page.wait_for_timeout(1500)
             finally:
                 try:
